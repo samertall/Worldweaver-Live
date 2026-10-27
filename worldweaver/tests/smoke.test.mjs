@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 const html=readFileSync(new URL('../index.html',import.meta.url),'utf8');
-const js=html.match(/<script\\s+type="module">([\\s\\S]*?)<\\/script>/i)?.[1];
+const js=html.match(/<script\s+type="module">([\s\S]*?)<\/script>/i)?.[1];
 test('application has actual HTML source and dashboard',()=>{assert.match(html,/<!doctype html>/i);assert.match(html,/id="worldCanvas"/);assert.ok(html.length>30000);});
 test('Twitch integration and all four commands included',()=>{for(const command of ['seed','rain','build','spark'])assert.match(html,new RegExp(command));assert.match(html,/EventSub/);assert.match(html,/WebSocket/);});
 test('gameplay and safety logic included',()=>{for(const fn of ['parseCommand','applyCommand','getMissionProgress','sanitizeSnapshot'])assert.ok(html.includes('function '+fn));assert.match(html,/duplicate/);assert.match(html,/cooldown/);});
