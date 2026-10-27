@@ -433,7 +433,8 @@ let narrative = state.events.length ? formatNarrative(state.events[0],state.comp
 let demoOn = !sessionStorage.getItem(TOKEN_KEY);
 let streamState = 'demo';
 let oauth = { token: sessionStorage.getItem(TOKEN_KEY) || '', clientId: localStorage.getItem(CLIENT_KEY) || '', userId:'', login:'' };
-let socket = null;
+let twitchConnection = null;
+let twitchGeneration = 0;
 let syncVersion = 0;
 let renderTimeout = null;
 let toastTimeout = null;
@@ -456,7 +457,7 @@ function setStatus(value,label){
   streamState=value;
   const chip=document.querySelector('.connection-chip');
   if(chip){chip.classList.toggle('live',value==='live');chip.classList.toggle('error',value==='error');}
-  text('connectionLabel',label);text('connectLabel',value==='live'?'Disconnect Twitch':'Connect Twitch');
+  text('connectionLabel',label);text('connectLabel',value==='live'||value==='connecting'?'Disconnect Twitch':'Connect Twitch');
   text('feedStatus',value==='live'?'TWITCH EVENTSUB':value==='connecting'?'CONNECTING':'SIMULATED CHAT');
   text('worldStatus',value==='live'?'CONNECTED TO TWITCH':value==='connecting'?'CONNECTING TO CHAT':'WORLD IS GROWING');
 }
@@ -592,7 +593,7 @@ function wireControls(){
   $('resetButton')?.addEventListener('click',resetWorld);
   $('exitStage')?.addEventListener('click',()=>{window.close();if(!window.closed)location.href=location.pathname;});
   $('connectButton')?.addEventListener('click',()=>{
-    if(streamState==='live'){disconnectTwitch();return;}
+    if(twitchConnection||streamState==='connecting'||streamState==='live'){disconnectTwitch();return;}
     $('clientId').value=oauth.clientId;
     $('redirectUrl').value=location.origin+location.pathname;
     text('connectError','');$('connectDialog').showModal();
@@ -635,66 +636,144 @@ async function twitchHelix(path,{method='GET',body}={}){
     ...(body?{body:JSON.stringify(body)}:{})
   });
   if(!response.ok){let desc='';try{desc=(await response.json()).message||''}catch{};
-    throw new Error(`Twitch ${response.status}: ${desc||response.statusText}`);
+    throw Object.assign(new Error(`Twitch ${response.status}: ${desc||response.statusText}`),{status:response.status});
   }
   return response.json();
 }
+// Socket ownership lives here so superseded events cannot revive a stopped session.
+function createEventSubConnection({subscribe,onMessage,onStatus,onFatal}){
+  const endpoint='wss://eventsub.wss.twitch.tv/ws';
+  let running=false,active=null,pending=null,retryTimer=null,attempt=0;
+  const current=record=>running&&(active===record||pending===record);
+  function retire(record){
+    if(!record)return;
+    clearTimeout(record.timer);clearTimeout(record.subscriptionTimer);
+    if(active===record)active=null;
+    if(pending===record)pending=null;
+    record.ws.close();
+  }
+  function stop(){
+    running=false;clearTimeout(retryTimer);retryTimer=null;
+    retire(pending);retire(active);
+  }
+  function fatal(error){stop();onFatal(error);}
+  function schedule(){
+    if(!running||pending||retryTimer!==null)return;
+    onStatus('connecting','RECONNECTING');
+    const delay=Math.min(1000*2**Math.min(attempt++,5),30000);
+    retryTimer=setTimeout(()=>{
+      retryTimer=null;
+      connect(active?.reconnectUrl||endpoint,Boolean(active?.reconnectUrl));
+    },delay);
+  }
+  function fail(record){
+    if(!current(record))return;
+    retire(record);schedule();
+  }
+  function arm(record,ms){
+    clearTimeout(record.timer);
+    record.timer=setTimeout(()=>fail(record),ms);
+  }
+  function connect(url,inherited=false){
+    if(!running||pending)return;
+    let ws;
+    try{ws=new WebSocket(url);}catch{schedule();return;}
+    const record={ws,timer:null,subscriptionTimer:null,welcomed:false,timeout:10000,reconnectUrl:null};
+    pending=record;arm(record,10000);
+    ws.addEventListener('message',async ev=>{
+      if(!current(record))return;
+      let message;try{message=JSON.parse(ev.data);}catch{return;}
+      const type=message?.metadata?.message_type;
+      if(type==='session_welcome'){
+        const session=message.payload?.session;
+        if(record.welcomed||!session?.id)return;
+        record.welcomed=true;
+        const seconds=session.keepalive_timeout_seconds;
+        if(Number.isFinite(seconds)&&seconds>0)record.timeout=seconds*1000;
+        arm(record,record.timeout);
+        try{
+          // Twitch migrates subscriptions itself on a directed reconnect.
+          if(!inherited){
+            record.subscriptionTimer=setTimeout(()=>fail(record),10000);
+            await subscribe(session.id);
+          }
+          if(!current(record))return;
+          clearTimeout(record.subscriptionTimer);
+          const old=active;active=record;pending=null;attempt=0;
+          clearTimeout(retryTimer);retryTimer=null;
+          retire(old);
+          if(record.reconnectUrl){onStatus('connecting','RECONNECTING');connect(record.reconnectUrl,true);}
+          else onStatus('live');
+        }catch(error){
+          if(!current(record))return;
+          if(error.status===401||error.status===403)fatal(error);
+          else fail(record);
+        }
+        return;
+      }
+      // Twitch may deliver chat or revocation before the Helix response arrives.
+      if(!record.welcomed)return;
+      if(type==='session_keepalive'||type==='notification'||type==='session_reconnect')arm(record,record.timeout);
+      if(type==='session_reconnect'){
+        const nextUrl=message.payload?.session?.reconnect_url;
+        // Only accept Twitch's TLS WebSocket endpoint, never arbitrary hosts.
+        try{
+          const parsed=new URL(nextUrl);
+          if(parsed.protocol!=='wss:'||parsed.hostname!=='eventsub.wss.twitch.tv'||parsed.port||parsed.username||parsed.password)return;
+        }catch{return;}
+        record.reconnectUrl=nextUrl;
+        if(!pending&&retryTimer===null){onStatus('connecting','RECONNECTING');connect(nextUrl,true);}
+      }else if(type==='revocation'){
+        fatal(new Error('Twitch permission revoked. Please reconnect.'));
+      }else if(type==='notification')onMessage(message);
+    });
+    ws.addEventListener('close',()=>fail(record));
+    ws.addEventListener('error',()=>fail(record));
+  }
+  return {start(){stop();running=true;attempt=0;onStatus('connecting','CONNECTING');connect(endpoint);},stop};
+}
+
 function handleTwitchMessage(message){
   const envelope=message?.metadata||{};
   if(envelope.message_type==='notification'&&message.payload?.subscription?.type==='channel.chat.message'){
     const chat=message.payload.event;
     processAction({message:chat?.message?.text||'',username:chat?.chatter_user_login||chat?.chatter_user_name||'viewer',id:chat?.message_id||envelope.message_id,source:'twitch'});
-  } else if(envelope.message_type==='session_reconnect'){
-    const nextUrl=message.payload?.session?.reconnect_url;
-    if(nextUrl)openTwitchSocket(nextUrl,true);
-  } else if(envelope.message_type==='revocation'){
-    showToast('Twitch permission revoked. Please reconnect.');disconnectTwitch(true);
   }
-}
-function openTwitchSocket(url='wss://eventsub.wss.twitch.tv/ws',reconnect=false){
-  if(!oauth.token)return;
-  const next=new WebSocket(url);
-  next.addEventListener('open',()=>setStatus('connecting','CONNECTING'));
-  next.addEventListener('message',async ev=>{
-    let message;try{message=JSON.parse(ev.data)}catch{return}
-    const type=message?.metadata?.message_type;
-    if(type==='session_welcome'){
-      if(reconnect){if(socket&&socket!==next)socket.close();socket=next;setStatus('live',`@${oauth.login.toUpperCase()}`);return;}
-      socket=next;
-      try{
-        await twitchHelix('eventsub/subscriptions',{method:'POST',body:{
-          type:'channel.chat.message',version:'1',
-          condition:{broadcaster_user_id:oauth.userId,user_id:oauth.userId},
-          transport:{method:'websocket',session_id:message.payload.session.id}
-        }});
-        setStatus('live',`@${oauth.login.toUpperCase()}`);demoOn=false;
-        if(!stageMode)showToast(`Connected to @${oauth.login}. Try !seed in chat!`);
-      }catch(error){setStatus('error','CONNECTION ERROR');showToast(error.message);next.close();}
-    } else handleTwitchMessage(message);
-  });
-  next.addEventListener('close',()=>{
-    if(socket===next&&oauth.token){socket=null;setStatus('error','DISCONNECTED');demoOn=false;
-      if(!stageMode)showToast('Twitch disconnected. Click Connect Twitch to retry.');}
-  });
-  next.addEventListener('error',()=>{if(!stageMode)showToast('Twitch WebSocket connection error.');});
-  if(!reconnect)socket=next;
 }
 async function initializeTwitch(){
   if(!oauth.token||!oauth.clientId)return;
+  const generation=++twitchGeneration;
+  twitchConnection?.stop();twitchConnection=null;
   setStatus('connecting','CONNECTING');demoOn=false;
   try{
     const users=await twitchHelix('users');
+    if(generation!==twitchGeneration)return;
     const me=users?.data?.[0];if(!me?.id)throw new Error('Could not identify Twitch account.');
     oauth.userId=me.id;oauth.login=me.login;
-    openTwitchSocket();
+    twitchConnection=createEventSubConnection({
+      subscribe:sessionId=>twitchHelix('eventsub/subscriptions',{method:'POST',body:{
+        type:'channel.chat.message',version:'1',
+        condition:{broadcaster_user_id:oauth.userId,user_id:oauth.userId},
+        transport:{method:'websocket',session_id:sessionId}
+      }}),
+      onMessage:handleTwitchMessage,
+      onStatus:(status,label)=>{
+        setStatus(status,status==='live'?`@${oauth.login.toUpperCase()}`:label);
+        demoOn=false;
+      },
+      onFatal:error=>{disconnectTwitch(true);setStatus('error','RECONNECT REQUIRED');showToast(error.message);}
+    });
+    twitchConnection.start();
   }catch(error){
+    if(generation!==twitchGeneration)return;
     setStatus('error','CONNECTION ERROR');showToast(error.message);
     sessionStorage.removeItem(TOKEN_KEY);oauth.token='';demoOn=true;
   }
 }
 function disconnectTwitch(silent=false){
-  const old=socket;socket=null;oauth.token='';oauth.userId='';sessionStorage.removeItem(TOKEN_KEY);
-  if(old)old.close();demoOn=true;setStatus('demo','DEMO MODE');
+  ++twitchGeneration;twitchConnection?.stop();twitchConnection=null;
+  oauth.token='';oauth.userId='';sessionStorage.removeItem(TOKEN_KEY);
+  demoOn=true;setStatus('demo','DEMO MODE');
   if(!silent)showToast('Twitch disconnected. Demo is available.');
 }
 function setupBroadcast(){
@@ -732,7 +811,7 @@ function start(){
   if(oauth.token){demoOn=false;initializeTwitch();} else setStatus('demo','DEMO MODE');
   animate(0);
   if(!stageMode)window.setInterval(demoTick,2300);
-  window.addEventListener('beforeunload',()=>{if(socket)socket.close();if(bc)bc.close();cancelAnimationFrame(renderTimeout);});
+  window.addEventListener('beforeunload',()=>{++twitchGeneration;twitchConnection?.stop();if(bc)bc.close();cancelAnimationFrame(renderTimeout);});
 }
 start();
 </script>
