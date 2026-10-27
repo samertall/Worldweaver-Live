@@ -11,7 +11,7 @@ Constraints: Node >=18, no dependencies, no CSS/rendering/gameplay changes. Test
 - [x] Implement the connection lifecycle and wire existing UI callbacks; run all tests.
 - [x] Add gameplay regression tests for cooldown/deduplication, harmony and progression without changing gameplay.
 - [x] Run npm run dev on 4173 and verify demo, controls, stage and reconnect behavior in Chromium; compare static design/gameplay source against baseline.
-- [ ] Commit, push branch and create PR (GitHub API currently blocked by network policy).
+- [x] Commit, push branch and create PR: https://github.com/samertall/test/pull/1.
 
 Review focus: old sockets closing during handoff; never-welcomed sockets; late fetch responses after disconnect; expired authorization retry loops; duplicate deliveries during overlap.
 
